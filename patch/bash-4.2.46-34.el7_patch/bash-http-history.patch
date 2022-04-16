@@ -1,0 +1,178 @@
+diff -Npru bash-4.2-orig/bashhist.c bash-4.2/bashhist.c
+--- bash-4.2-orig/bashhist.c	2022-04-16 15:01:04.708521142 +0000
++++ bash-4.2/bashhist.c	2022-04-16 15:08:35.023457777 +0000
+@@ -42,6 +42,13 @@
+ #  include <syslog.h>
+ #endif
+ 
++#if defined (HTTP_HISTORY)
++#  include <curl/curl.h>
++#  include <stdlib.h>
++#  include <sys/time.h>
++#  include "string.h"
++#endif
++
+ #include "shell.h"
+ #include "flags.h"
+ #include "input.h"
+@@ -724,6 +731,78 @@ bash_syslog_history (line)
+     }
+ }
+ #endif
++
++#if defined (HTTP_HISTORY)
++#define HTTP_PLYLOAD_MAXLEN 2048
++static size_t cb(char *d, size_t n, size_t l, void *p)
++{
++  (void)d;
++  (void)p;
++  return n*l;
++}
++
++int call_url(char *url,char *data)
++{
++
++    CURL *easy_handle = curl_easy_init();
++    if (NULL == easy_handle)
++    {
++        printf("get a easy handle failed.");
++        return -1;
++    }
++
++    struct curl_slist *headers = NULL;
++    headers = curl_slist_append(headers, "Accept: application/json");
++    headers = curl_slist_append(headers, "Content-Type: application/json");
++    headers = curl_slist_append(headers, "charset: utf-8");
++
++    curl_easy_setopt(easy_handle,CURLOPT_URL,url);
++    curl_easy_setopt(easy_handle, CURLOPT_CUSTOMREQUEST, "PUT");
++    curl_easy_setopt(easy_handle, CURLOPT_HTTPHEADER, headers);
++    curl_easy_setopt(easy_handle, CURLOPT_POSTFIELDS, data);
++    curl_easy_setopt(easy_handle, CURLOPT_USERAGENT, "libcrp/0.1");
++    curl_easy_setopt(easy_handle, CURLOPT_WRITEFUNCTION, cb);
++
++    curl_easy_perform(easy_handle);
++
++    curl_easy_cleanup(easy_handle);
++
++    return 0;
++}
++
++void
++bash_http_history (line)
++     const char *line;
++{
++  char buf[512];
++  getcwd(buf, sizeof(buf));
++
++  struct timeval stamp;
++  gettimeofday(&stamp, NULL);
++
++  char ip[16] = {0};
++  char * tmpstr = getenv("SSH_CLIENT");
++  int nlength = 0;
++  while(tmpstr != NULL){
++    if(tmpstr[nlength] == ' '){
++        break;
++    }
++    nlength++;
++    if(nlength > 16){
++        break;
++    }
++  }
++  if(nlength > 0 && nlength <= 16)
++    strncpy(ip,tmpstr,nlength);
++
++  char jsonObj[HTTP_PLYLOAD_MAXLEN + 512];
++  if (strlen(line) <= HTTP_PLYLOAD_MAXLEN){
++      sprintf(jsonObj, "{\"timestamp\":%ld,\"ip\":\"%s\",\"ppid\":%d,\"pid\":%d,\"sid\":%d,\"uid\":%d,\"user\":\"%s\",\"tty\":\"%s\",\"pwd\":\"%s\",\"cmd\":\"%s\"}\n",stamp.tv_sec, ip,  getppid(), getpid(), getsid(getpid()), current_user.uid, current_user.user_name,ttyname(1),buf, line);
++
++      call_url(HTTP_URL,jsonObj);
++  }
++}
++#endif
+      	
+ /* Add a line to the history list.
+    The variable COMMAND_ORIENTED_HISTORY controls the style of history
+@@ -792,6 +871,10 @@ bash_add_history (line)
+     bash_syslog_history (line);
+ #endif
+ 
++#if defined (HTTP_HISTORY)
++      bash_http_history (line);
++#endif
++
+   using_history ();
+ }
+ 
+diff -Npru bash-4.2-orig/config-top.h bash-4.2/config-top.h
+--- bash-4.2-orig/config-top.h	2022-04-16 15:01:04.712521132 +0000
++++ bash-4.2/config-top.h	2022-04-16 15:04:23.340052097 +0000
+@@ -116,5 +116,12 @@
+ #define SYSLOG_SHOPT 0
+ #endif
+ 
++/* Define if you want each line saved to the history list in bashhist.c:
++ *    bash_add_history() to be sent to http server. */
++#define HTTP_HISTORY
++#if defined (HTTP_HISTORY)
++#  define HTTP_URL "http://127.0.0.1:6666/logger/bash_history" 
++#endif
++
+ /* Define if you want to include code in shell.c to support wordexp(3) */
+ /* #define WORDEXP_OPTION */
+diff -Npru bash-4.2-orig/Makefile.in bash-4.2/Makefile.in
+--- bash-4.2-orig/Makefile.in	2022-04-16 15:01:03.480524041 +0000
++++ bash-4.2/Makefile.in	2022-04-16 15:04:58.679968646 +0000
+@@ -539,7 +539,7 @@ CREATED_MAKEFILES = Makefile builtins/Ma
+ 
+ $(Program):  .build $(OBJECTS) $(BUILTINS_DEP) $(LIBDEP)
+ 	$(RM) $@
+-	$(PURIFY) $(CC) $(BUILTINS_LDFLAGS) $(LIBRARY_LDFLAGS) $(LDFLAGS) -o $(Program) $(OBJECTS) $(LIBS)
++	$(PURIFY) $(CC) $(BUILTINS_LDFLAGS) $(LIBRARY_LDFLAGS) $(LDFLAGS) -o $(Program) $(OBJECTS) $(LIBS) -lcurl -lm
+ 	ls -l $(Program)
+ 	-$(SIZE) $(Program)
+ 
+diff -Npru bash-4.2-orig/shell.c bash-4.2/shell.c
+--- bash-4.2-orig/shell.c	2022-04-16 15:01:04.344522001 +0000
++++ bash-4.2/shell.c	2022-04-16 15:10:32.643180102 +0000
+@@ -76,6 +76,11 @@
+ #  include "bashline.h"
+ #endif
+ 
++#if defined (HTTP_HISTORY)
++#  include <curl/curl.h>
++#  include <stdlib.h>
++#endif
++
+ #include <tilde/tilde.h>
+ #include <glob/strmatch.h>
+ 
+@@ -369,6 +374,16 @@ main (argc, argv, env)
+   env = environ;
+ #endif /* __OPENNT */
+ 
++#if defined (HTTP_HISTORY)
++    CURLcode return_code;
++    return_code = curl_global_init(CURL_GLOBAL_ALL);
++    if (CURLE_OK != return_code)
++    {
++        printf("init libcurl failed.");
++        exit (-1);
++    }
++#endif
++
+   USE_VAR(argc);
+   USE_VAR(argv);
+   USE_VAR(env);
+@@ -960,6 +975,10 @@ sh_exit (s)
+     trace_malloc_stats (get_name_for_error (), (char *)NULL);
+ #endif
+ 
++#if defined (HTTP_HISTORY)
++  curl_global_cleanup();
++#endif
++
+   exit (s);
+ }
+ 
